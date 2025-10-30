@@ -1,10 +1,9 @@
 # app.py
-# Veritia.ai — Name Risk Score (Deterministic Authority Edition)
-# --------------------------------------------------------------
+# Veritia.ai — Name Risk Score (Deterministic Authority + Guardrails)
+# -------------------------------------------------------------------
 # ✅ Multi-stage SERP search (SerpAPI → Bing → DDG-Lite fallback)
-# ✅ Deterministic authority via MediaWiki (Wikipedia) + IMDb check
-# ✅ Authority Shield + Notoriety Floor (from SERP OR open data)
-# ✅ Heavier weights for Authority & Data Broker signals
+# ✅ Deterministic authority via Wikipedia REST + IMDb suggest API
+# ✅ Authority Shield + Notoriety Floor + HARD GUARDRAILS (celebs vs non-celebs)
 # ✅ Low-confidence mode (no hard stop on thin results)
 # ✅ Lead capture (email + consent), save to Google Sheets or CSV
 # ✅ Safe-by-design: public results only; no PII displayed/saved
@@ -219,45 +218,48 @@ def search_results(query: str, n: int) -> List[Dict]:
 # =========================
 # DETERMINISTIC AUTHORITY (Open Data)
 # =========================
-def wikipedia_has_person_page(name: str) -> bool:
-    """Use MediaWiki API to detect a person-like page for this name."""
+def wikipedia_exact_person(name: str) -> bool:
+    """
+    Deterministic: Wikipedia REST Summary for exact-title page; must look like a person.
+    """
     try:
-        endpoint = "https://en.wikipedia.org/w/api.php"
-        params = {
-            "action": "query",
-            "format": "json",
-            "list": "search",
-            "srsearch": f'intitle:"{name}"',
-            "srlimit": 3
-        }
-        r = requests.get(endpoint, params=params, timeout=12)
-        r.raise_for_status()
+        title = name.replace(" ", "_")
+        url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{title}"
+        r = requests.get(url, headers={"User-Agent": "veritia/1.0"}, timeout=10)
+        if r.status_code != 200:
+            return False
         data = r.json()
-        hits = data.get("query", {}).get("search", [])
-        # Heuristic: exact or near-exact title match strongly suggests an entity page
-        for h in hits:
-            title = (h.get("title") or "").lower()
-            if title == name.lower() or name.lower() in title:
-                return True
-        return False
+        # Accept exact title matches that aren't "no-page" and resemble a person
+        if data.get("title","").lower() != name.lower():
+            return False
+        if data.get("type") == "disambiguation":
+            return False
+        desc = (data.get("description") or "").lower()
+        extract = (data.get("extract") or "").lower()
+        hints = ["actor","actress","singer","politician","athlete","director","writer","producer",
+                 "public figure","businessman","businesswoman","film","television","musician"]
+        return any(k in desc for k in hints) or any(k in extract for k in hints)
     except Exception:
         return False
 
 def imdb_has_name_hit(name: str) -> bool:
-    """Lightweight IMDb presence check via 'find' page; looks for /name/nm... pattern."""
+    """
+    Deterministic: IMDb name suggestion endpoint — look for /name/nm... with matching tokens.
+    """
     try:
-        url = f"https://www.imdb.com/find/?q={quote_plus(name)}&s=nm"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(url, headers=headers, timeout=12)
-        if r.status_code >= 400:
+        url = "https://v2.sg.media-imdb.com/suggestion/{}/{}.json".format(name[0].lower(), name.replace(" ", "%20"))
+        r = requests.get(url, headers={"User-Agent": "veritia/1.0"}, timeout=10)
+        if r.status_code != 200:
             return False
-        return bool(re.search(r"/name/nm\d+", r.text))
-    except Exception:
+        data = r.json()
+        parts = [p.lower() for p in name.split() if p]
+        for item in data.get("d", []):
+            if not item.get("id","").startswith("nm"):
+                continue
+            label = (item.get("l","") + " " + item.get("s","")).lower()
+            if all(p in label for p in parts[:2]):  # first two tokens present somewhere
+                return True
         return False
-
-def serpapi_has_knowledge_panel() -> bool:
-    try:
-        return bool(serpapi_last_raw and serpapi_last_raw.get("knowledge_graph"))
     except Exception:
         return False
 
@@ -316,11 +318,11 @@ def score_from_signals(signals: Dict) -> Tuple[int, Dict[str, int]]:
     - Breach Risk: 0–5 (1 per breach)
     """
     subs = {}
-    # Brokers (typical names get hit here)
+    # Brokers
     brokers = signals["data_brokers"]
     subs["Data Broker Exposure"] = min(36, brokers * 6)
 
-    # Sensitive (cap lower so celebs don't spike just from transcripts)
+    # Sensitive (cap lower so celebs don't spike from transcripts)
     sens = signals["sensitive"]["phones"] + signals["sensitive"]["addresses"]
     subs["Sensitive Info Exposure"] = min(20, sens * 5)
 
@@ -333,7 +335,7 @@ def score_from_signals(signals: Dict) -> Tuple[int, Dict[str, int]]:
     else: drift_points = 0
     subs["Identity Drift"] = min(20, drift_points)
 
-    # Authority deficit (Famous people should crash this near-zero)
+    # Authority deficit
     auth = signals["authority_hits"]
     subs["Authority Deficit"] = 30 if auth == 0 else (18 if auth == 1 else (10 if auth == 2 else (4 if auth == 3 else 0)))
 
@@ -344,10 +346,10 @@ def score_from_signals(signals: Dict) -> Tuple[int, Dict[str, int]]:
     subs["Breach Risk"] = min(5, signals.get("breach_count", 0))
 
     total = int(sum(subs.values()))
-    return total, subs
+    return total, subs)
 
 # =========================
-# AUTHORITY SHIELD & FLOOR
+# AUTHORITY SHIELD & GUARDRAILS
 # =========================
 def has_wikipedia_from_urls(urls): 
     return any("wikipedia.org/wiki/" in u for u in urls)
@@ -363,19 +365,23 @@ def major_press_hits(urls):
     ]
     return sum(any(m in u for m in majors) for u in urls)
 
+def serpapi_has_knowledge_panel() -> bool:
+    try:
+        return bool(serpapi_last_raw and serpapi_last_raw.get("knowledge_graph"))
+    except Exception:
+        return False
+
 def authority_shield_factor(authority_hits:int, urls:list, wiki_bool:bool, imdb_bool:bool, kp_bool:bool) -> float:
     """
     Returns a multiplier (0.25–1.0). Lower = more protection (celebs).
     Triggers: Wikipedia, IMDb, major press volume, authority hits, knowledge panel.
     """
     shield = 1.0
-    # Use either SERP-derived flags or deterministic open-data checks
     if wiki_bool or has_wikipedia_from_urls(urls): shield *= 0.5
     if imdb_bool or has_imdb_from_urls(urls):      shield *= 0.7
-    mp = major_press_hits(urls)
-    if mp >= 3:             shield *= 0.6
-    if authority_hits >= 4: shield *= 0.6
-    if kp_bool:             shield *= 0.6
+    if major_press_hits(urls) >= 3:                shield *= 0.6
+    if authority_hits >= 4:                        shield *= 0.6
+    if kp_bool:                                     shield *= 0.6
     return max(0.25, shield)  # never less than 25% of raw risk
 
 def notoriety_floor(wiki_bool:bool, imdb_bool:bool, authority_hits:int, kp_bool:bool) -> int:
@@ -414,10 +420,10 @@ if submitted:
     query = " ".join([x for x in [name, city, org] if x]).strip()
     st.info(f"Scanning public results for: **{query}**")
 
-    # Deterministic authority checks (open data) — do first so we always have a signal
-    wiki_flag = wikipedia_has_person_page(name)
+    # Deterministic authority checks first (do not depend on SERP)
+    wiki_flag = wikipedia_exact_person(name)
     imdb_flag = imdb_has_name_hit(name)
-    kp_flag = False  # default; may be set by SerpAPI later
+    kp_flag = False
 
     with st.spinner("Collecting signals..."):
         results = search_results(query, RESULTS_TO_FETCH)
@@ -440,7 +446,7 @@ if submitted:
         brokers  = count_data_brokers(urls)
         authhits = count_authority_hits(urls)
 
-        # If SerpAPI used and knowledge panel present, set kp_flag
+        # SerpAPI knowledge panel
         if serpapi_last_raw and SEARCH_PROVIDER == "serpapi":
             kp_flag = bool(serpapi_last_raw.get("knowledge_graph"))
 
@@ -458,12 +464,28 @@ if submitted:
             "breach_count": breach,
         }
 
+        # ---------------- SCORING ----------------
         raw_score, subs = score_from_signals(signals)
 
-        # Apply Authority Shield using BOTH sources (SERP + deterministic)
+        # Baseline shielded score
         shield = authority_shield_factor(authhits, urls, wiki_flag, imdb_flag, kp_flag)
         adjusted_score = int(round(raw_score * shield))
-        adjusted_score = max(adjusted_score, notoriety_floor(wiki_flag, imdb_flag, authhits, kp_flag))
+
+        # HARD GUARDRAILS
+        is_celebrity = wiki_flag or imdb_flag or kp_flag or authhits >= 4 or major_press_hits(urls) >= 3
+        if is_celebrity:
+            adjusted_score = min(adjusted_score, 12)  # celeb ceiling
+        else:
+            # Non-celebrity floors
+            if subs["Authority Deficit"] >= 18 and subs["Data Broker Exposure"] >= 6:
+                adjusted_score = max(adjusted_score, 45)
+            elif subs["Authority Deficit"] >= 18 and subs["Identity Drift"] >= 6:
+                adjusted_score = max(adjusted_score, 30)
+
+        # Notoriety floor for celebs (never zero)
+        if is_celebrity:
+            adjusted_score = max(adjusted_score, 7)
+
         lvl = risk_band(adjusted_score)
 
     # Save lead
@@ -522,7 +544,8 @@ if submitted:
     with st.expander("Debug"):
         st.write("Provider:", SEARCH_PROVIDER, "| Confidence:", conf_label)
         st.write("Raw score:", raw_score, "Shield factor:", round(shield, 2), "Adjusted:", adjusted_score)
-        st.write("SERP authority hits:", signals["authority_hits"])
+        st.write("Celebrity detected:", is_celebrity)
+        st.write("SERP authority hits:", signals["authority_hits"], "| MajorPress:", major_press_hits(urls))
         st.write("Open-data authority: Wikipedia:", wiki_flag, "IMDb:", imdb_flag, "KnowledgePanel:", kp_flag)
         st.write("Data broker hits:", signals["data_brokers"])
         st.write("Negative headlines:", signals["neg_headlines"])
