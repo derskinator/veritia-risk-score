@@ -1,13 +1,11 @@
 # app.py
-# Veritia.ai — Name Risk Score (Deterministic Authority + Guardrails + Listings)
-# -------------------------------------------------------------------------------
-# ✅ Multi-stage SERP search (SerpAPI → Bing → DDG-Lite fallback)
-# ✅ Deterministic authority via Wikipedia REST + IMDb suggest + Wikidata
-# ✅ Authority Shield + Notoriety Floor + HARD GUARDRAILS (celebs vs non-celebs)
-# ✅ Low-confidence mode (no hard stop on thin results)
-# ✅ Lead capture (email + consent), save to Google Sheets or CSV
-# ✅ Listings: “Likely You” vs “Other” with CSV export
-# ✅ Safe-by-design: public results only; no PII displayed/saved
+# Veritia.ai — Deterministic Risk (No-Keys Required) + Listings + Guardrails
+# -------------------------------------------------------------------------
+# Runs accurately with NO paid search keys:
+# - Celebrity detection: Wikipedia REST + IMDb suggest + Wikidata
+# - Exposure detection: per-domain DDG-lite site: queries (brokers, authority, news)
+# - Listings: scored & bucketed "Likely You" vs "Other"
+# Optional: SerpAPI/Bing improve general listings, but not required
 
 import os, re, csv, time, html, textwrap
 from io import StringIO
@@ -18,28 +16,33 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
-# =========================
-# BRAND / PAGE
-# =========================
+# --------------------------
+# PAGE
+# --------------------------
 st.set_page_config(page_title="Veritia — Name Risk Score", page_icon="👁️", layout="centered")
-APP_TITLE = "Veritia.ai — Name Risk Score"
-APP_TAGLINE = "See what AI & search can infer about you — and how to fix it."
 st.markdown(
-    f"<h1 style='text-align:center;margin-bottom:0;'>{APP_TITLE}</h1>"
-    f"<p style='text-align:center;color:#8a8f98;margin-top:4px;'>{APP_TAGLINE}</p>",
+    "<h1 style='text-align:center;margin-bottom:0;'>Veritia.ai — Name Risk Score</h1>"
+    "<p style='text-align:center;color:#8a8f98;margin-top:4px;'>See what AI & search can infer about you — and how to fix it.</p>",
     unsafe_allow_html=True,
 )
 
-# =========================
-# SETTINGS & CONSTANTS
-# =========================
-SEARCH_PROVIDER = st.secrets.get("apis", {}).get("SEARCH_PROVIDER", "serpapi")  # serpapi | bing | ddg_lite
-RESULTS_TO_FETCH = int(st.secrets.get("app", {}).get("RESULTS_TO_FETCH", 18))
-FALLBACK_MIN_RESULTS = 3  # proceed in low-confidence mode if we get this many
+# --------------------------
+# SECRETS / SETTINGS
+# --------------------------
+SEARCH_PROVIDER = st.secrets.get("apis", {}).get("SEARCH_PROVIDER", "ddg_lite").lower()  # serpapi|bing|ddg_lite
+SERPAPI_KEY = st.secrets.get("apis", {}).get("SERPAPI_KEY", "")
+BING_KEY    = st.secrets.get("apis", {}).get("BING_KEY", "")
 
-NEGATIVE_KEYWORDS = [
-    "arrest","lawsuit","scam","fraud","harassment","controversy","fired","charged","probe","sued"
-]
+RESULTS_TO_FETCH = int(st.secrets.get("app", {}).get("RESULTS_TO_FETCH", 18))
+FALLBACK_MIN_RESULTS = 3
+
+USE_SHEETS = bool(st.secrets.get("gcp_service_account")) and bool(st.secrets.get("leads"))
+CSV_FALLBACK_PATH = "leads.csv"
+
+# --------------------------
+# CONSTANTS
+# --------------------------
+NEGATIVE_KEYWORDS = ["arrest","lawsuit","scam","fraud","harassment","controversy","fired","charged","probe","sued"]
 
 DATA_BROKER_DOMAINS = [
     "spokeo.com","beenverified.com","mylife.com","whitepages.com","radaris.com","intelius.com",
@@ -53,14 +56,12 @@ AUTHORITY_SITES_MEDIA = [
 ]
 AUTHORITY_SITES_DIRECT = ["wikipedia.org","wikidata.org","linkedin.com","imdb.com","crunchbase.com","orcid.org"]
 
-SOCIAL_DOMAINS = ["facebook.com","instagram.com","tiktok.com","x.com","twitter.com","threads.net"]
+NEWS_DOMAINS = [
+    "nytimes.com","washingtonpost.com","bbc.com","theguardian.com","reuters.com","apnews.com",
+    "latimes.com","wsj.com","cnn.com","foxnews.com","nbcnews.com","cnbc.com","bloomberg.com","forbes.com"
+]
 
-BING_KEY = st.secrets.get("apis", {}).get("BING_KEY", "")
-SERPAPI_KEY = st.secrets.get("apis", {}).get("SERPAPI_KEY", "")
-HIBP_KEY = st.secrets.get("apis", {}).get("HIBP_KEY", "")
-
-USE_SHEETS = bool(st.secrets.get("gcp_service_account")) and bool(st.secrets.get("leads"))
-CSV_FALLBACK_PATH = "leads.csv"
+SOCIAL_DOMAINS = ["facebook.com","instagram.com","tiktok.com","x.com","twitter.com","threads.net","youtube.com","linkedin.com"]
 
 # Listings scoring knobs
 NAME_EXACT_WEIGHT = 40
@@ -71,66 +72,30 @@ BROKER_PENALTY = -10
 GENERIC_SOCIAL_PENALTY = -6
 MIN_LIKELY_SCORE = 25
 
-# Store raw SerpAPI JSON for knowledge panel detection (optional)
+# Provider cache
 serpapi_last_raw = None
 
-# =========================
-# LEAD STORAGE
-# =========================
-def _get_ws():
-    if not USE_SHEETS:
-        return None
-    import gspread
-    from google.oauth2.service_account import Credentials
-    sa = st.secrets["gcp_service_account"]
-    creds = Credentials.from_service_account_info(sa, scopes=[
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
-    ])
-    gc = gspread.authorize(creds)
-    sh = gc.open(st.secrets["leads"]["sheet_name"])
-    ws = sh.worksheet(st.secrets["leads"]["worksheet"])
-    return ws
-
-def save_lead(name: str, email: str, score: str, city: str, org: str, q: str, confidence: str):
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    row = [ts, name, email, score, city, org, q, confidence]
-    try:
-        if USE_SHEETS:
-            ws = _get_ws()
-            ws.append_row(row)
-        else:
-            newfile = not os.path.exists(CSV_FALLBACK_PATH)
-            with open(CSV_FALLBACK_PATH, "a", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                if newfile:
-                    w.writerow(["ts","name","email","score","city","org","query","confidence"])
-                w.writerow(row)
-    except Exception:
-        st.warning("Lead save issue (we still show your results).")
-
-# =========================
-# SEARCH PROVIDERS
-# =========================
+# --------------------------
+# UTIL
+# --------------------------
 def domain_from_url(u: str) -> str:
     try:
-        netloc = urlparse(u).netloc.lower()
-        if netloc.startswith("www."): netloc = netloc[4:]
-        return netloc
+        d = urlparse(u).netloc.lower()
+        return d[4:] if d.startswith("www.") else d
     except Exception:
         return ""
 
 def ddg_lite_search(query: str, n: int) -> List[Dict]:
+    """DuckDuckGo Lite HTML fallback. Returns list of {link,title,snippet} or [] with warning."""
     try:
         url = "https://lite.duckduckgo.com/lite/"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(url, params={"q": query}, headers=headers, timeout=15)
+        r = requests.get(url, params={"q": query}, headers={"User-Agent":"Mozilla/5.0"}, timeout=15)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "lxml")
         results = []
         for a in soup.select("a"):
             href = (a.get("href") or "").strip()
-            if not href.startswith("http"):
+            if not href.startswith("http"): 
                 continue
             title = (a.get_text() or "").strip()
             parent = a.find_parent()
@@ -143,87 +108,62 @@ def ddg_lite_search(query: str, n: int) -> List[Dict]:
             if len(results) >= n:
                 break
         return results
-    except Exception:
+    except Exception as e:
+        st.warning(f"DDG-lite error: {type(e).__name__}: {e}")
         return []
-
-def bing_search(query: str, n: int) -> List[Dict]:
-    if not BING_KEY: return []
-    url = "https://api.bing.microsoft.com/v7.0/search"
-    headers = {"Ocp-Apim-Subscription-Key": BING_KEY}
-    params = {"q": query, "count": n, "mkt": "en-US", "safeSearch": "Moderate"}
-    r = requests.get(url, headers=headers, params=params, timeout=15)
-    r.raise_for_status()
-    data = r.json()
-    return [{"link": it.get("url",""), "title": it.get("name",""), "snippet": it.get("snippet","")}
-            for it in data.get("webPages", {}).get("value", [])]
 
 def serpapi_google(query: str, n: int) -> List[Dict]:
     global serpapi_last_raw
-    if not SERPAPI_KEY: return []
-    url = "https://serpapi.com/search.json"
-    params = {"engine": "google", "q": query, "num": n, "api_key": SERPAPI_KEY}
-    r = requests.get(url, params=params, timeout=15)
-    r.raise_for_status()
-    data = r.json()
-    serpapi_last_raw = data
-    out = []
-    for it in data.get("organic_results", []):
-        out.append({"link": it.get("link",""), "title": it.get("title",""), "snippet": it.get("snippet","")})
-    return out
+    if not SERPAPI_KEY:
+        return []
+    try:
+        url = "https://serpapi.com/search.json"
+        r = requests.get(url, params={"engine":"google","q":query,"num":n,"api_key":SERPAPI_KEY}, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        serpapi_last_raw = data
+        return [{"link": it.get("link",""), "title": it.get("title",""), "snippet": it.get("snippet","")} 
+                for it in data.get("organic_results", [])]
+    except Exception as e:
+        st.warning(f"SerpAPI error: {type(e).__name__}: {e}")
+        return []
 
-def _provider_search(provider: str, query: str, n: int):
-    if provider == "serpapi":
-        return serpapi_google(query, n)
-    if provider == "bing":
-        return bing_search(query, n)
-    return ddg_lite_search(query, n)
+def bing_search(query: str, n: int) -> List[Dict]:
+    if not BING_KEY:
+        return []
+    try:
+        url = "https://api.bing.microsoft.com/v7.0/search"
+        r = requests.get(url, headers={"Ocp-Apim-Subscription-Key": BING_KEY}, params={"q":query,"count":n}, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        vals = data.get("webPages", {}).get("value", [])
+        return [{"link": it.get("url",""), "title": it.get("name",""), "snippet": it.get("snippet","")} for it in vals]
+    except Exception as e:
+        st.warning(f"Bing error: {type(e).__name__}: {e}")
+        return []
 
-def search_results(query: str, n: int) -> List[Dict]:
-    def run_queries(qs, providers):
-        seen, merged = set(), []
-        per = max(4, n // max(1, len(qs)))
-        for prov in providers:
-            for q in qs:
-                for r in _provider_search(prov, q, per) or []:
-                    u = (r.get("link") or "").strip()
-                    if not u or u in seen:
-                        continue
-                    seen.add(u)
-                    merged.append(r)
-                    if len(merged) >= n:
-                        return merged
-        return merged
+def provider_search(query: str, n: int) -> List[Dict]:
+    """General listings provider chain: SerpAPI -> Bing -> DDG Lite."""
+    for prov in [SEARCH_PROVIDER, "serpapi", "bing", "ddg_lite"]:
+        if prov == "serpapi" and SERPAPI_KEY:
+            res = serpapi_google(query, n)
+        elif prov == "bing" and BING_KEY:
+            res = bing_search(query, n)
+        else:
+            res = ddg_lite_search(query, n)
+        if res:
+            return res[:n]
+    return []
 
-    primary = SEARCH_PROVIDER if SEARCH_PROVIDER in ("serpapi","bing") else "ddg_lite"
-    provider_order = [primary] + [p for p in ("serpapi","bing","ddg_lite") if p != primary]
-
-    stage1_q = [
-        f'"{query}"',
-        f'"{query}" site:linkedin.com',
-        f'"{query}" -site:facebook.com -site:instagram.com'
-    ]
-    res = run_queries(stage1_q, [primary])
-    if len(res) >= FALLBACK_MIN_RESULTS:
-        return res[:n]
-
-    stage2_q = [query, f"{query} profile", f"{query} linkedin"]
-    res2 = run_queries(stage2_q, [primary])
-    if len(res2) >= FALLBACK_MIN_RESULTS:
-        return res2[:n]
-
-    res3 = run_queries(stage1_q + stage2_q, provider_order[1:])
-    return res3[:n]
-
-# =========================
-# DETERMINISTIC AUTHORITY (Open Data)
-# =========================
+# --------------------------
+# DETERMINISTIC CELEBRITY CHECKS
+# --------------------------
 def wikipedia_exact_person(name: str) -> bool:
     try:
         title = name.replace(" ", "_")
         url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{title}"
-        r = requests.get(url, headers={"User-Agent": "veritia/1.0"}, timeout=10)
-        if r.status_code != 200:
-            return False
+        r = requests.get(url, headers={"User-Agent":"veritia/1.0"}, timeout=10)
+        if r.status_code != 200: return False
         data = r.json()
         if data.get("title","").lower() != name.lower(): return False
         if data.get("type") == "disambiguation": return False
@@ -237,14 +177,12 @@ def wikipedia_exact_person(name: str) -> bool:
 
 def imdb_has_name_hit(name: str) -> bool:
     try:
-        url = "https://v2.sg.media-imdb.com/suggestion/{}/{}.json".format(name[0].lower(), name.replace(" ", "%20"))
-        r = requests.get(url, headers={"User-Agent": "veritia/1.0"}, timeout=10)
-        if r.status_code != 200:
-            return False
-        data = r.json()
+        url = f"https://v2.sg.media-imdb.com/suggestion/{name[0].lower()}/{name.replace(' ','%20')}.json"
+        r = requests.get(url, headers={"User-Agent":"veritia/1.0"}, timeout=10)
+        if r.status_code != 200: return False
         parts = [p.lower() for p in name.split() if p]
-        for item in data.get("d", []):
-            if not item.get("id","").startswith("nm"):
+        for item in r.json().get("d", []):
+            if not item.get("id","").startswith("nm"): 
                 continue
             label = (item.get("l","") + " " + item.get("s","")).lower()
             if all(p in label for p in parts[:2]):
@@ -254,25 +192,17 @@ def imdb_has_name_hit(name: str) -> bool:
         return False
 
 def wikidata_is_notable_person(name: str) -> bool:
-    """Strong deterministic check via Wikidata: human (Q5) + many sitelinks."""
     try:
-        s = requests.get(
-            "https://www.wikidata.org/w/api.php",
-            params={"action": "wbsearchentities", "search": name, "language": "en", "format": "json", "limit": 1},
-            timeout=10,
-            headers={"User-Agent": "veritia/1.0"},
-        )
+        s = requests.get("https://www.wikidata.org/w/api.php",
+            params={"action":"wbsearchentities","search":name,"language":"en","format":"json","limit":1},
+            headers={"User-Agent":"veritia/1.0"}, timeout=10)
         s.raise_for_status()
         hits = s.json().get("search", [])
         if not hits: return False
         qid = hits[0].get("id")
         if not qid: return False
-
-        e = requests.get(
-            f"https://www.wikidata.org/wiki/Special:EntityData/{qid}.json",
-            timeout=10,
-            headers={"User-Agent": "veritia/1.0"},
-        )
+        e = requests.get(f"https://www.wikidata.org/wiki/Special:EntityData/{qid}.json",
+                         headers={"User-Agent":"veritia/1.0"}, timeout=10)
         e.raise_for_status()
         ent = e.json().get("entities", {}).get(qid, {})
         claims = ent.get("claims", {})
@@ -285,127 +215,56 @@ def wikidata_is_notable_person(name: str) -> bool:
     except Exception:
         return False
 
-# =========================
-# SIGNALS & SCORING
-# =========================
-def detect_sensitive_patterns(text: str) -> Dict[str, int]:
-    phone = len(re.findall(r"\b(?:\+?\d{1,2}\s*)?(?:\(?\d{3}\)?[\s\-.]?\d{3}[\s\-.]?\d{4})\b", text))
-    street = len(re.findall(r"\b\d{1,5}\s+\w+(?:\s+\w+)?\s+(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Lane|Ln|Dr|Drive|Ct|Court)\b", text, flags=re.I))
-    email = len(re.findall(r"[\w\.-]+@[\w\.-]+\.\w+", text))
-    return {"phones": phone, "addresses": street, "emails": email}
-
-def sentiment_headline_neg(headline: str) -> bool:
-    h = (headline or "").lower()
-    return any(k in h for k in NEGATIVE_KEYWORDS)
-
-def count_data_brokers(urls: List[str]) -> int:
-    return sum(any(db in u for db in DATA_BROKER_DOMAINS) for u in urls)
-
-def count_authority_hits(urls: List[str]) -> int:
-    hits = 0
-    for u in urls:
-        d = domain_from_url(u)
-        if not d: continue
-        if any(d.endswith(auth) for auth in AUTHORITY_SITES_DIRECT): hits += 1; continue
-        if d.endswith(".gov") or d.endswith(".edu"): hits += 1; continue
-        if any(dom in d for dom in AUTHORITY_SITES_MEDIA): hits += 1
-    return hits
-
-def hibp_breach_count(email: str) -> int:
-    if not email or not HIBP_KEY: return 0
-    url = f"https://haveibeenpwned.com/api/v3/breachedaccount/{email}"
-    headers = {"hibp-api-key": HIBP_KEY, "user-agent": "veritia-risk-check/1.0"}
-    r = requests.get(url, headers=headers, params={"truncateResponse": "true"}, timeout=15)
-    if r.status_code == 404: return 0
-    r.raise_for_status()
-    return len(r.json())
-
-def score_from_signals(signals: Dict) -> Tuple[int, Dict[str, int]]:
-    """
-    0 (best) to 100 (worst).
-    - Data Broker Exposure: 0–36 (6 per hit)
-    - Sensitive Info Exposure: 0–20 (5 per phone/address pattern)
-    - Identity Drift: 0–20 (domain diversity)
-    - Authority Deficit: 0–30 (0=great, 30=none)
-    - Negative Press: 0–10 (3 per negative headline)
-    - Breach Risk: 0–5 (1 per breach)
-    """
-    subs = {}
-    brokers = signals["data_brokers"]
-    subs["Data Broker Exposure"] = min(36, brokers * 6)
-
-    sens = signals["sensitive"]["phones"] + signals["sensitive"]["addresses"]
-    subs["Sensitive Info Exposure"] = min(20, sens * 5)
-
-    unique_domains = len(set(signals["domains"]))
-    if unique_domains >= 10: drift_points = 14
-    elif unique_domains >= 8: drift_points = 10
-    elif unique_domains >= 5: drift_points = 6
-    elif unique_domains >= 3: drift_points = 3
-    else: drift_points = 0
-    subs["Identity Drift"] = min(20, drift_points)
-
-    auth = signals["authority_hits"]
-    subs["Authority Deficit"] = 30 if auth == 0 else (18 if auth == 1 else (10 if auth == 2 else (4 if auth == 3 else 0)))
-
-    subs["Negative Press"] = min(10, signals["neg_headlines"] * 3)
-    subs["Breach Risk"] = min(5, signals.get("breach_count", 0))
-
-    total = int(sum(subs.values()))
-    return total, subs
-
-# =========================
-# AUTHORITY SHIELD & GUARDRAILS
-# =========================
-def has_wikipedia_from_urls(urls): 
-    return any("wikipedia.org/wiki/" in u for u in urls)
-
-def has_imdb_from_urls(urls): 
-    return any("imdb.com" in u for u in urls)
-
-def major_press_hits(urls):
-    majors = [
-        "nytimes.com","guardian.com","washingtonpost.com","bbc.com","bloomberg.com",
-        "forbes.com","reuters.com","apnews.com","variety.com","hollywoodreporter.com",
-        "rollingstone.com","vanityfair.com","latimes.com"
-    ]
-    return sum(any(m in u for m in majors) for u in urls)
-
 def serpapi_has_knowledge_panel() -> bool:
     try:
         return bool(serpapi_last_raw and serpapi_last_raw.get("knowledge_graph"))
     except Exception:
         return False
 
-def authority_shield_factor(authority_hits:int, urls:list, wiki_bool:bool, imdb_bool:bool, kp_bool:bool) -> float:
-    shield = 1.0
-    if wiki_bool or has_wikipedia_from_urls(urls): shield *= 0.5
-    if imdb_bool or has_imdb_from_urls(urls):      shield *= 0.7
-    if major_press_hits(urls) >= 3:                shield *= 0.6
-    if authority_hits >= 4:                        shield *= 0.6
-    if kp_bool:                                     shield *= 0.6
-    return max(0.25, shield)
+# --------------------------
+# PER-DOMAIN “SITE:” SCANS
+# --------------------------
+def ddg_site_scan_exact(name: str, domain: str, limit: int = 5) -> List[Dict]:
+    """Run a site:domain "<name>" query to count & fetch matches. No API key needed."""
+    q = f'site:{domain} "{name}"'
+    return ddg_lite_search(q, limit)
 
-def notoriety_floor(wiki_bool:bool, imdb_bool:bool, authority_hits:int, kp_bool:bool) -> int:
-    if wiki_bool or imdb_bool or authority_hits >= 5 or kp_bool:
-        return 7
-    return 0
+def count_matches_on_domains(name: str, domains: List[str], per_domain_limit=3) -> Tuple[int, List[Dict]]:
+    total = 0
+    hits: List[Dict] = []
+    for d in domains:
+        res = ddg_site_scan_exact(name, d, per_domain_limit)
+        # Count only clear matches (title/snippet contain the exact phrase)
+        for r in res:
+            text = (r.get("title","") + " " + r.get("snippet","")).lower()
+            if re.search(rf'\b{re.escape(name.lower())}\b', text):
+                total += 1
+                hits.append(r)
+    return total, hits
+
+# --------------------------
+# SIGNALS & SCORING
+# --------------------------
+def detect_sensitive_patterns(text: str) -> Dict[str, int]:
+    phone = len(re.findall(r"\b(?:\+?\d{1,2}\s*)?(?:\(?\d{3}\)?[\s\-.]?\d{3}[\s\-.]?\d{4})\b", text))
+    address = len(re.findall(r"\b\d{1,5}\s+\w+(?:\s+\w+)?\s+(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Lane|Ln|Dr|Drive|Ct|Court)\b", text, flags=re.I))
+    email = len(re.findall(r"[\w\.-]+@[\w\.-]+\.\w+", text))
+    return {"phones": phone, "addresses": address, "emails": email}
 
 def risk_band(score: int) -> str:
     if score >= 70: return "HIGH"
     if score >= 40: return "MEDIUM"
     return "LOW"
 
-# =========================
-# LISTINGS SCORING & BUCKETING
-# =========================
+# --------------------------
+# LISTINGS SCORING
+# --------------------------
 def tokenize_name(full: str):
     return [t for t in re.findall(r"[A-Za-z]+", full or "") if t]
 
 def has_exact_phrase(phrase: str, text: str) -> bool:
     if not phrase or not text: return False
-    p = re.escape(phrase.strip())
-    return bool(re.search(rf"\b{p}\b", text, flags=re.I))
+    return bool(re.search(rf"\b{re.escape(phrase.strip())}\b", text, flags=re.I))
 
 def contains_all_tokens(tokens, text: str) -> bool:
     if not tokens or not text: return False
@@ -416,9 +275,7 @@ def classify_domain(url: str):
     d = domain_from_url(url)
     tags = []
     if any(db in d for db in DATA_BROKER_DOMAINS): tags.append("broker")
-    if any(dom in d for dom in AUTHORITY_SITES_MEDIA) or \
-       any(d.endswith(auth) for auth in AUTHORITY_SITES_DIRECT) or \
-       d.endswith(".edu") or d.endswith(".gov"):
+    if any(dom in d for dom in AUTHORITY_SITES_MEDIA) or any(d.endswith(auth) for auth in AUTHORITY_SITES_DIRECT) or d.endswith(".gov") or d.endswith(".edu"):
         tags.append("authority")
     if any(s in d for s in SOCIAL_DOMAINS): tags.append("social")
     return d, tags
@@ -427,45 +284,66 @@ def listing_relevance(name: str, city: str, org: str, item: Dict) -> Dict:
     title = (item.get("title") or "").strip()
     snippet = (item.get("snippet") or "").strip()
     url = (item.get("link") or "").strip()
-
     name_tokens = tokenize_name(name)
-    score = 0
-    reasons = []
+    score, reasons = 0, []
 
-    if has_exact_phrase(name, title):
-        score += NAME_EXACT_WEIGHT; reasons.append("Exact name in title")
-    elif has_exact_phrase(name, snippet):
-        score += NAME_EXACT_WEIGHT // 2; reasons.append("Exact name in snippet")
-
+    if has_exact_phrase(name, title):   score += NAME_EXACT_WEIGHT; reasons.append("Exact name in title")
+    elif has_exact_phrase(name, snippet): score += NAME_EXACT_WEIGHT//2; reasons.append("Exact name in snippet")
     if contains_all_tokens(name_tokens, title + " " + snippet):
         score += NAME_TOKEN_WEIGHT * len(name_tokens); reasons.append("All name tokens present")
-
-    if city and has_exact_phrase(city, title + " " + snippet):
-        score += CITY_ORG_BONUS; reasons.append("City match")
-    if org and contains_all_tokens(tokenize_name(org), title + " " + snippet):
-        score += CITY_ORG_BONUS; reasons.append("Company/role match")
+    if city and has_exact_phrase(city, title + " " + snippet): score += CITY_ORG_BONUS; reasons.append("City match")
+    if org and contains_all_tokens(tokenize_name(org), title + " " + snippet): score += CITY_ORG_BONUS; reasons.append("Company/role match")
 
     domain, tags = classify_domain(url)
-    if "authority" in tags:
-        score += DOMAIN_AUTH_BONUS; reasons.append("Authority domain")
-    if "broker" in tags:
-        score += BROKER_PENALTY; reasons.append("Data broker")
-    if "social" in tags and not has_exact_phrase(name, title):
-        score += GENERIC_SOCIAL_PENALTY; reasons.append("Generic social")
+    if "authority" in tags: score += DOMAIN_AUTH_BONUS; reasons.append("Authority domain")
+    if "broker" in tags:    score += BROKER_PENALTY; reasons.append("Data broker")
+    if "social" in tags and not has_exact_phrase(name, title): score += GENERIC_SOCIAL_PENALTY; reasons.append("Generic social")
 
-    return {"url": url, "domain": domain, "title": title or domain, "snippet": snippet,
-            "score": score, "reasons": reasons, "tags": tags}
+    return {"url": url, "domain": domain, "title": title or domain, "snippet": snippet, "score": score, "reasons": reasons, "tags": tags}
 
 def rank_listings_for_person(name: str, city: str, org: str, raw_results: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
     scored = [listing_relevance(name, city, org, r) for r in raw_results if r.get("link")]
     scored.sort(key=lambda x: (x["score"], -len(x["domain"])), reverse=True)
     likely = [r for r in scored if r["score"] >= MIN_LIKELY_SCORE][:15]
-    other = [r for r in scored if r["score"] < MIN_LIKELY_SCORE][:15]
+    other  = [r for r in scored if r["score"] < MIN_LIKELY_SCORE][:15]
     return likely, other
 
-# =========================
-# FORM (Lead Gate)
-# =========================
+# --------------------------
+# LEADS
+# --------------------------
+def _get_ws():
+    if not USE_SHEETS:
+        return None
+    import gspread
+    from google.oauth2.service_account import Credentials
+    sa = st.secrets["gcp_service_account"]
+    creds = Credentials.from_service_account_info(sa, scopes=[
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ])
+    gc = gspread.authorize(creds)
+    sh = gc.open(st.secrets["leads"]["sheet_name"])
+    return sh.worksheet(st.secrets["leads"]["worksheet"])
+
+def save_lead(name: str, email: str, score: str, city: str, org: str, q: str, confidence: str):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    row = [ts, name, email, score, city, org, q, confidence]
+    try:
+        if USE_SHEETS:
+            ws = _get_ws()
+            ws.append_row(row)
+        else:
+            newfile = not os.path.exists(CSV_FALLBACK_PATH)
+            with open(CSV_FALLBACK_PATH, "a", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                if newfile: w.writerow(["ts","name","email","score","city","org","query","confidence"])
+                w.writerow(row)
+    except Exception:
+        st.warning("Lead save issue (results still shown).")
+
+# --------------------------
+# FORM
+# --------------------------
 with st.form("risk_form"):
     name = st.text_input("Full name*", placeholder="e.g., Keanu Reeves")
     city = st.text_input("City / Region (optional)")
@@ -475,110 +353,106 @@ with st.form("risk_form"):
     consent = st.checkbox("I agree to receive my results and follow-up by email.")
     submitted = st.form_submit_button("Get My Risk Score")
 
-st.caption(f"Search provider: **{SEARCH_PROVIDER}**")
+st.caption(f"Search provider preference: **{SEARCH_PROVIDER}** (keys optional)")
 
-# =========================
+# --------------------------
 # RUN
-# =========================
+# --------------------------
 if submitted:
     if not (name and email and agree and consent):
         st.error("Please complete name, email, and both checkboxes.")
         st.stop()
 
-    query = " ".join([x for x in [name, city, org] if x]).strip()
-    st.info(f"Scanning public results for: **{query}**")
+    q_person = " ".join([x for x in [name, city, org] if x]).strip()
+    st.info(f"Scanning public results for: **{q_person}**")
 
-    # Deterministic authority checks (do not depend on SERP)
-    wiki_flag = wikipedia_exact_person(name)
-    imdb_flag = imdb_has_name_hit(name)
+    # 1) Deterministic celebrity flags (do NOT depend on SERP providers)
+    wiki_flag     = wikipedia_exact_person(name)
+    imdb_flag     = imdb_has_name_hit(name)
     wikidata_flag = wikidata_is_notable_person(name)
-    kp_flag = False
+    kp_flag       = serpapi_has_knowledge_panel()  # only true if SerpAPI used earlier
 
-    with st.spinner("Collecting signals..."):
-        results = search_results(query, RESULTS_TO_FETCH)
+    # 2) Per-domain exposure scans (deterministic, no keys needed)
+    broker_count, broker_hits = count_matches_on_domains(name, DATA_BROKER_DOMAINS, per_domain_limit=2)
+    authority_count, authority_hits = count_matches_on_domains(name, AUTHORITY_SITES_DIRECT + AUTHORITY_SITES_MEDIA, per_domain_limit=2)
+    news_count, news_hits = count_matches_on_domains(name, NEWS_DOMAINS, per_domain_limit=2)
 
-        urls     = [r.get("link","") for r in results if r.get("link")]
-        titles   = [r.get("title","") for r in results]
-        snippets = [r.get("snippet","") for r in results]
-        domains  = [domain_from_url(u) for u in urls]
+    # Optional general listings (uses provider chain; falls back to DDG-lite)
+    general_results = provider_search(q_person, RESULTS_TO_FETCH)
+    urls     = [r.get("link","") for r in general_results if r.get("link")]
+    titles   = [r.get("title","") for r in general_results]
+    snippets = [r.get("snippet","") for r in general_results]
+    combined_snippets = " ".join(snippets)
 
-        low_confidence = len(urls) < FALLBACK_MIN_RESULTS
+    # 3) Low-confidence flag for general listings
+    low_confidence = len(urls) < FALLBACK_MIN_RESULTS
 
-        # Listings bucketing (Likely You vs Other)
-        likely_listings, other_listings = rank_listings_for_person(name, city, org, results)
+    # 4) Build “Likely You” vs “Other” from general results
+    likely_listings, other_listings = rank_listings_for_person(name, city, org, general_results)
 
-        # Backfill empty titles with hostnames (helps DDG-lite)
-        for i, t in enumerate(titles):
-            if not t and i < len(domains) and domains[i]:
-                titles[i] = domains[i].split(".")[0].title()
+    # 5) Signals
+    sens = detect_sensitive_patterns(combined_snippets)
+    neg  = sum(1 for t in titles if any(k in (t or "").lower() for k in NEGATIVE_KEYWORDS))
 
-        combined_snippets = " ".join(snippets)
-        sens     = detect_sensitive_patterns(combined_snippets)
-        neg      = sum(1 for t in titles if sentiment_headline_neg(t))
-        brokers  = count_data_brokers(urls)
-        authhits = count_authority_hits(urls)
+    # Compose signals needed for score buckets
+    signals = {
+        "data_brokers": broker_count,
+        "authority_hits": authority_count,  # from deterministic scans
+        "neg_headlines": news_count + neg,  # deterministic news + generic neg headlines
+        "domains": [domain_from_url(u) for u in urls],
+        "sensitive": sens,
+        "breach_count": 0,
+    }
 
-        if serpapi_last_raw and SEARCH_PROVIDER == "serpapi":
-            kp_flag = bool(serpapi_last_raw.get("knowledge_graph"))
+    # 6) Subscores (explicit, simple & stable)
+    subs = {}
+    subs["Data Broker Exposure"]   = min(36, signals["data_brokers"] * 6)
+    sens_points = signals["sensitive"]["phones"] + signals["sensitive"]["addresses"]
+    subs["Sensitive Info Exposure"] = min(20, sens_points * 5)
+    unique_domains = len(set(signals["domains"]))
+    subs["Identity Drift"]         = 14 if unique_domains >= 10 else 10 if unique_domains >= 8 else 6 if unique_domains >= 5 else 3 if unique_domains >= 3 else 0
+    auth = signals["authority_hits"]
+    subs["Authority Deficit"]      = 30 if auth == 0 else 18 if auth == 1 else 10 if auth == 2 else 4 if auth == 3 else 0
+    subs["Negative Press"]         = min(10, signals["neg_headlines"] * 3)
+    subs["Breach Risk"]            = 0  # off by default
 
-        breach   = 0  # Optional: enable HIBP lookups
-        # if email and HIBP_KEY:
-        #     breach = hibp_breach_count(email)
+    raw_score = int(sum(subs.values()))
 
-        signals = {
-            "data_brokers": brokers,
-            "sensitive": sens,
-            "neg_headlines": neg,
-            "authority_hits": authhits,
-            "domains": domains,
-            "titles": titles,
-            "breach_count": breach,
-        }
+    # 7) Guardrails (bulletproof separation)
+    is_celebrity = (wiki_flag or imdb_flag or wikidata_flag or kp_flag or auth >= 3 or news_count >= 2)
 
-        # ---- SCORING ----
-        raw_score, subs = score_from_signals(signals)
+    # Base shield for celebs (they have authority; lower risk)
+    shield = 0.6 if is_celebrity else 1.0
+    adjusted = int(round(raw_score * shield))
 
-        shield = authority_shield_factor(authhits, urls, wiki_flag, imdb_flag, kp_flag)
-        adjusted_score = int(round(raw_score * shield))
+    if is_celebrity:
+        adjusted = min(adjusted, 12)
+        adjusted = max(adjusted, 7)
+    else:
+        high_brokers   = subs["Data Broker Exposure"] >= 6
+        weak_authority = subs["Authority Deficit"]   >= 18
+        some_drift     = subs["Identity Drift"]      >= 6
+        if weak_authority and high_brokers:
+            adjusted = max(adjusted, 50)
+        elif weak_authority and some_drift:
+            adjusted = max(adjusted, 35)
+        # exposure boost if many likely matches
+        if len(likely_listings) >= 5:
+            adjusted = min(100, adjusted + 5)
 
-        # Stronger celeb detection (any of these should trip)
-        is_celebrity = (
-            wiki_flag or imdb_flag or kp_flag or wikidata_flag or
-            authhits >= 3 or major_press_hits(urls) >= 2
-        )
-
-        # Hard guardrails
-        if is_celebrity:
-            adjusted_score = min(adjusted_score, 12)
-            adjusted_score = max(adjusted_score, 7)  # never zero
-        else:
-            high_brokers = subs["Data Broker Exposure"] >= 6
-            weak_authority = subs["Authority Deficit"] >= 18
-            some_drift = subs["Identity Drift"] >= 6
-            if weak_authority and high_brokers:
-                adjusted_score = max(adjusted_score, 50)
-            elif weak_authority and some_drift:
-                adjusted_score = max(adjusted_score, 35)
-
-        # Light exposure boost if many likely matches for non-celeb
-        if not is_celebrity and len(likely_listings) >= 5:
-            adjusted_score = min(100, adjusted_score + 5)
-
-        lvl = risk_band(adjusted_score)
-
-    # Save lead
+    lvl = risk_band(adjusted)
     conf_label = "low" if low_confidence else "normal"
-    save_lead(name=name, email=email, score=str(adjusted_score), city=city, org=org, q=query, confidence=conf_label)
 
-    # =========================
-    # RESULTS UI
-    # =========================
+    # 8) Save lead
+    save_lead(name=name, email=email, score=str(adjusted), city=city, org=org, q=q_person, confidence=conf_label)
+
+    # --------------------------
+    # UI
+    # --------------------------
     st.markdown("---")
     badge = " (low confidence)" if low_confidence else ""
-    st.markdown(f"## Overall Risk: **{adjusted_score}/100** — {lvl}{badge}")
-    if low_confidence:
-        st.info("Limited public results were found; this score is computed with reduced confidence.")
-    st.progress(min(adjusted_score, 100) / 100)
+    st.markdown(f"## Overall Risk: **{adjusted}/100** — {lvl}{badge}")
+    st.progress(min(adjusted, 100) / 100)
 
     c1, c2 = st.columns(2)
     with c1:
@@ -591,31 +465,19 @@ if submitted:
         st.metric("Breach Risk", f"{subs['Breach Risk']}/5")
 
     st.markdown("### Top Recommendations")
-    def quick_fixes(signals: Dict, subs: Dict[str, int]) -> List[str]:
-        recs = []
-        if subs["Data Broker Exposure"] >= 12:
-            recs.append("Submit removal requests to top data brokers (Spokeo, BeenVerified, Whitepages, MyLife).")
-        if subs["Sensitive Info Exposure"] >= 10:
-            recs.append("Audit public posts & PDFs; remove phone/address; request cache removal where needed.")
-        if subs["Authority Deficit"] >= 8:
-            recs.append("Publish a canonical bio page with schema.org/Person; create/clean Wikidata; complete LinkedIn.")
-        if subs["Identity Drift"] >= 6:
-            recs.append("Standardize your headline across LinkedIn, your site, and press mentions.")
-        if subs["Negative Press"] >= 6:
-            recs.append("Publish counter-narratives on credible sites; pursue structured PR to add positive citations.")
-        if subs["Breach Risk"] >= 3:
-            recs.append("Change passwords and enable 2FA; remove old emails from public profiles.")
-        if not recs:
-            recs.append("Maintain quarterly audits; set Google Alerts; keep canonical bio & schema updated.")
-        return recs[:5]
+    recs = []
+    if subs["Data Broker Exposure"] >= 12: recs.append("Submit removal requests to top data brokers (Spokeo, BeenVerified, Whitepages, MyLife).")
+    if subs["Sensitive Info Exposure"] >= 10: recs.append("Audit public posts & PDFs; remove phone/address; request cache removal where needed.")
+    if subs["Authority Deficit"] >= 8: recs.append("Publish a canonical bio page with schema.org/Person; create/clean Wikidata; complete LinkedIn.")
+    if subs["Identity Drift"] >= 6: recs.append("Standardize your name/headline across your site, LinkedIn, and press mentions.")
+    if subs["Negative Press"] >= 6: recs.append("Publish counter-narratives on credible sites; pursue structured PR to add positive citations.")
+    if not recs: recs.append("Maintain quarterly audits; set Google Alerts; keep canonical bio & schema updated.")
+    for r in recs[:5]:
+        st.write("• " + r)
 
-    for rec in quick_fixes(signals, subs):
-        st.write("• " + rec)
-
-    # ======= Listings UI =======
+    # Listings (from general provider chain)
     st.markdown("### Listings that appear to be about you")
-    st.caption("These are public search results that likely reference your name. We do not display or store any private information.")
-
+    st.caption("These are public search results that likely reference your name. We do not display or store private information.")
     def render_badges(tags, reasons):
         b = []
         for t in tags:
@@ -625,59 +487,50 @@ if submitted:
         for r in reasons[:2]:
             b.append(f"• {r}")
         return "  ·  ".join(b)
-
     def render_listing(item):
         safe_title = html.escape(item["title"])
         safe_snip = html.escape(textwrap.shorten(item["snippet"], width=200, placeholder="…"))
-        badges = render_badges(item["tags"], item["reasons"])
         st.markdown(f"""
 **[{safe_title}]({item['url']})**  
 <span style="color:#6b7280">{html.escape(item['domain'])}</span> • score {item['score']}  
 {safe_snip}  
-<span style="color:#6b7280">{badges}</span>
+<span style="color:#6b7280">{render_badges(item['tags'], item['reasons'])}</span>
 """, unsafe_allow_html=True)
 
     if likely_listings:
         st.write(f"**Likely You** ({len(likely_listings)})")
-        for it in likely_listings:
-            render_listing(it)
+        for it in likely_listings: render_listing(it)
     else:
         st.write("_No strong matches yet. Try adding a city or company to your query._")
-
     with st.expander("Other results (probably not you)"):
         if other_listings:
-            for it in other_listings:
-                render_listing(it)
+            for it in other_listings: render_listing(it)
         else:
             st.write("_None to show._")
 
-    # CSV export of listings
+    # CSV export
     csv_buf = StringIO()
-    writer = csv.writer(csv_buf)
-    writer.writerow(["bucket","score","title","url","domain","tags","reasons","snippet"])
+    w = csv.writer(csv_buf)
+    w.writerow(["bucket","score","title","url","domain","tags","reasons","snippet"])
     for it in likely_listings:
-        writer.writerow(["likely", it["score"], it["title"], it["url"], it["domain"], ";".join(it["tags"]), ";".join(it["reasons"]), it["snippet"]])
+        w.writerow(["likely", it["score"], it["title"], it["url"], it["domain"], ";".join(it["tags"]), ";".join(it["reasons"]), it["snippet"]])
     for it in other_listings:
-        writer.writerow(["other", it["score"], it["title"], it["url"], it["domain"], ";".join(it["tags"]), ";".join(it["reasons"]), it["snippet"]])
+        w.writerow(["other", it["score"], it["title"], it["url"], it["domain"], ";".join(it["tags"]), ";".join(it["reasons"]), it["snippet"]])
     st.download_button("Download listings as CSV", data=csv_buf.getvalue(), file_name="veritia_listings.csv", mime="text/csv")
 
+    # Debug
     with st.expander("What we checked (summary)"):
-        st.write(f"- {len(urls)} public results scanned")
-        st.write(f"- Data broker hits: {signals['data_brokers']}")
-        st.write(f"- Authority sources present (SERP): {signals['authority_hits']}")
-        st.write(f"- Deterministic authority: Wikipedia={wiki_flag}, IMDb={imdb_flag}, Wikidata={wikidata_flag}, KnowledgePanel={kp_flag}")
-        st.write(f"- Potential sensitive patterns flagged (not shown): phones={sens['phones']} addresses={sens['addresses']} emails={sens['emails']}")
+        st.write(f"- Data broker matches (site: scans): {broker_count}")
+        st.write(f"- Authority matches (site: scans): {authority_count}")
+        st.write(f"- News matches (site: scans): {news_count}")
+        st.write(f"- Deterministic flags: Wikipedia={wiki_flag}, IMDb={imdb_flag}, Wikidata={wikidata_flag}, KnowledgePanel={kp_flag}")
+        st.write(f"- General listings fetched: {len(urls)} (confidence: {('low' if low_confidence else 'normal')})")
+        st.write(f"- Sensitive patterns (not shown): phones={sens['phones']} addresses={sens['addresses']} emails={sens['emails']}")
 
-    with st.expander("Debug"):
-        st.write("Provider:", SEARCH_PROVIDER, "| Confidence:", conf_label)
-        st.write("Raw score:", raw_score, "Shield factor:", round(shield, 2), "Adjusted:", adjusted_score)
-        st.write("Celebrity detected:", is_celebrity)
-        st.write("SERP authority hits:", signals["authority_hits"], "| MajorPress:", major_press_hits(urls))
-        st.write("Open-data authority:", {"Wikipedia": wiki_flag, "IMDb": imdb_flag, "Wikidata": wikidata_flag, "KnowledgePanel": kp_flag})
-        st.write("Data broker hits:", signals["data_brokers"])
-        st.write("Negative headlines:", signals["neg_headlines"])
-        st.write("Unique domains:", len(set(signals["domains"])))
-        st.write("Sample URLs:", urls[:10])
-
-    st.caption("We analyze public search results and patterns only. We never display or store private information.")
+    with st.expander("Debug details"):
+        st.write("Raw score:", raw_score, "| Adjusted:", adjusted, "| Band:", lvl)
+        st.write("Subscores:", subs)
+        st.write("Sample broker hits:", [h.get("link") for h in broker_hits[:5]])
+        st.write("Sample authority hits:", [h.get("link") for h in authority_hits[:5]])
+        st.write("Sample news hits:", [h.get("link") for h in news_hits[:5]])
 
