@@ -1,11 +1,12 @@
 # app.py
-# Veritia.ai — Name Risk Score (Authority Shield Edition)
+# Veritia.ai — Name Risk Score (Best-Path Build)
 # -------------------------------------------------------
-# - Multi-query search (SerpAPI, Bing, or DDG-Lite fallback)
-# - Heavier weights for Authority Deficit & Data Broker Exposure
-# - Authority Shield + Notoriety Floor to separate celebs vs typical names
-# - Lead capture (email + consent), save to Google Sheets or CSV
-# - Safe-by-design: analyzes public results and patterns only
+# ✅ Multi-stage search (SerpAPI → Bing → DDG-Lite fallback)
+# ✅ Strong separation: Authority Shield + Notoriety Floor
+# ✅ Heavier weights for Authority & Data Broker signals
+# ✅ Low-confidence mode (no hard stop on thin results)
+# ✅ Lead capture (email + consent), save to Google Sheets or CSV
+# ✅ Safe-by-design: public results only; no PII displayed/saved
 
 import os, re, csv, time
 from typing import List, Dict, Tuple
@@ -30,8 +31,9 @@ st.markdown(
 # =========================
 # SETTINGS & CONSTANTS
 # =========================
-SEARCH_PROVIDER = st.secrets.get("apis", {}).get("SEARCH_PROVIDER", "ddg_lite")  # "serpapi" | "bing" | "ddg_lite"
+SEARCH_PROVIDER = st.secrets.get("apis", {}).get("SEARCH_PROVIDER", "serpapi")  # "serpapi" | "bing" | "ddg_lite"
 RESULTS_TO_FETCH = int(st.secrets.get("app", {}).get("RESULTS_TO_FETCH", 18))
+FALLBACK_MIN_RESULTS = 3  # proceed in low-confidence mode if we get this many
 
 NEGATIVE_KEYWORDS = [
     "arrest","lawsuit","scam","fraud","harassment","controversy","fired","charged","probe","sued"
@@ -43,11 +45,12 @@ DATA_BROKER_DOMAINS = [
     "fastpeoplesearch.com","clustrmaps.com"
 ]
 
-# Expanded to strongly favor well-known authority sources
-AUTHORITY_SITES = [
-    "wikipedia.org","wikidata.org","linkedin.com","crunchbase.com","imdb.com",
-    "gov","edu","scholar.google","orcid.org","bloomberg.com","forbes.com","nytimes.com","britannica.com"
+# Expanded authority list: verified entities & top media
+AUTHORITY_SITES_MEDIA = [
+    "bloomberg.com","forbes.com","nytimes.com","britannica.com","scholar.google",
+    "theguardian.com","washingtonpost.com","bbc.com","reuters.com","apnews.com"
 ]
+AUTHORITY_SITES_DIRECT = ["wikipedia.org","wikidata.org","linkedin.com","imdb.com","crunchbase.com","orcid.org"]
 
 BING_KEY = st.secrets.get("apis", {}).get("BING_KEY", "")
 SERPAPI_KEY = st.secrets.get("apis", {}).get("SERPAPI_KEY", "")
@@ -77,9 +80,9 @@ def _get_ws():
     ws = sh.worksheet(st.secrets["leads"]["worksheet"])
     return ws
 
-def save_lead(name: str, email: str, score: str, city: str, org: str, q: str):
+def save_lead(name: str, email: str, score: str, city: str, org: str, q: str, confidence: str):
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    row = [ts, name, email, score, city, org, q]
+    row = [ts, name, email, score, city, org, q, confidence]
     try:
         if USE_SHEETS:
             ws = _get_ws()
@@ -89,7 +92,7 @@ def save_lead(name: str, email: str, score: str, city: str, org: str, q: str):
             with open(CSV_FALLBACK_PATH, "a", newline="", encoding="utf-8") as f:
                 w = csv.writer(f)
                 if newfile:
-                    w.writerow(["ts","name","email","score","city","org","query"])
+                    w.writerow(["ts","name","email","score","city","org","query","confidence"])
                 w.writerow(row)
     except Exception:
         st.warning("Lead save issue (we still show your results).")
@@ -157,29 +160,62 @@ def serpapi_google(query: str, n: int) -> List[Dict]:
         out.append({"link": it.get("link",""), "title": it.get("title",""), "snippet": it.get("snippet","")})
     return out
 
+def _provider_search(provider: str, query: str, n: int):
+    if provider == "serpapi":
+        return serpapi_google(query, n)
+    if provider == "bing":
+        return bing_search(query, n)
+    return ddg_lite_search(query, n)
+
 def search_results(query: str, n: int) -> List[Dict]:
-    """Run multiple queries, merge & dedupe for stronger signals."""
-    base_queries = [
-        f'"{query}"',                          # exact match
+    """
+    Three-stage strategy:
+      1) Tight, high-precision queries on the primary provider
+      2) Broaden queries on the primary provider
+      3) Try other providers with both query sets
+    """
+    def run_queries(qs, providers):
+        seen, merged = set(), []
+        per = max(4, n // max(1, len(qs)))
+        for prov in providers:
+            for q in qs:
+                for r in _provider_search(prov, q, per) or []:
+                    u = (r.get("link") or "").strip()
+                    if not u or u in seen:
+                        continue
+                    seen.add(u)
+                    merged.append(r)
+                    if len(merged) >= n:
+                        return merged
+        return merged
+
+    # Provider order: chosen primary → others
+    primary = SEARCH_PROVIDER if SEARCH_PROVIDER in ("serpapi","bing") else "ddg_lite"
+    provider_order = [primary] + [p for p in ("serpapi","bing","ddg_lite") if p != primary]
+
+    # Stage 1 — tight
+    stage1_q = [
+        f'"{query}"',
         f'"{query}" site:linkedin.com',
         f'"{query}" -site:facebook.com -site:instagram.com'
     ]
-    per = max(4, n // len(base_queries))
-    seen, merged = set(), []
-    for q in base_queries:
-        if SEARCH_PROVIDER == "serpapi":
-            chunk = serpapi_google(q, per)
-        elif SEARCH_PROVIDER == "bing":
-            chunk = bing_search(q, per)
-        else:
-            chunk = ddg_lite_search(q, per)
-        for r in chunk:
-            u = (r.get("link") or "").strip()
-            if not u or u in seen:
-                continue
-            seen.add(u)
-            merged.append(r)
-    return merged[:n]
+    res = run_queries(stage1_q, [primary])
+    if len(res) >= FALLBACK_MIN_RESULTS:
+        return res[:n]
+
+    # Stage 2 — broaden
+    stage2_q = [
+        query,
+        f'{query} profile',
+        f'{query} linkedin',
+    ]
+    res2 = run_queries(stage2_q, [primary])
+    if len(res2) >= FALLBACK_MIN_RESULTS:
+        return res2[:n]
+
+    # Stage 3 — other providers with both query sets
+    res3 = run_queries(stage1_q + stage2_q, provider_order[1:])
+    return res3[:n]
 
 # =========================
 # SIGNALS & SCORING
@@ -204,16 +240,13 @@ def count_authority_hits(urls: List[str]) -> int:
         d = domain_from_url(u)
         if not d:
             continue
-        # direct domain matches
-        if any(d.endswith(auth) for auth in ["wikipedia.org","wikidata.org","linkedin.com","imdb.com","crunchbase.com","orcid.org"]):
+        if any(d.endswith(auth) for auth in AUTHORITY_SITES_DIRECT):  # Direct authority
             hits += 1
             continue
-        # TLD/institutional heuristics
-        if d.endswith(".gov") or d.endswith(".edu"):
+        if d.endswith(".gov") or d.endswith(".edu"):  # Institutional TLDs
             hits += 1
             continue
-        # high-authority media
-        if any(dom in d for dom in ["bloomberg.com","forbes.com","nytimes.com","britannica.com","scholar.google"]):
+        if any(dom in d for dom in AUTHORITY_SITES_MEDIA):  # Major media
             hits += 1
     return hits
 
@@ -279,13 +312,14 @@ def has_imdb(urls):
     return any("imdb.com" in u for u in urls)
 
 def major_press_hits(urls):
-    majors = ["nytimes.com","guardian.com","washingtonpost.com","bbc.com","bloomberg.com",
-              "forbes.com","reuters.com","apnews.com","variety.com","hollywoodreporter.com",
-              "rollingstone.com","vanityfair.com","latimes.com"]
+    majors = [
+        "nytimes.com","guardian.com","washingtonpost.com","bbc.com","bloomberg.com",
+        "forbes.com","reuters.com","apnews.com","variety.com","hollywoodreporter.com",
+        "rollingstone.com","vanityfair.com","latimes.com"
+    ]
     return sum(any(m in u for m in majors) for u in urls)
 
 def serpapi_has_knowledge_panel() -> bool:
-    # Uses the stored raw SerpAPI JSON (if any)
     try:
         return bool(serpapi_last_raw and serpapi_last_raw.get("knowledge_graph"))
     except Exception:
@@ -302,7 +336,7 @@ def authority_shield_factor(authority_hits:int, urls:list) -> float:
     mp = major_press_hits(urls)
     if mp >= 3:             shield *= 0.6
     if authority_hits >= 4: shield *= 0.6
-    if serpapi_has_knowledge_panel():  # only true when using SerpAPI and KG is present
+    if serpapi_has_knowledge_panel():
         shield *= 0.6
     return max(0.25, shield)  # never less than 25% of raw risk
 
@@ -311,6 +345,11 @@ def notoriety_floor(urls, authority_hits:int) -> int:
     if has_wikipedia(urls) or has_imdb(urls) or authority_hits >= 5 or serpapi_has_knowledge_panel():
         return 7
     return 0
+
+def risk_band(score: int) -> str:
+    if score >= 70: return "HIGH"
+    if score >= 40: return "MEDIUM"
+    return "LOW"
 
 # =========================
 # FORM (Lead Gate)
@@ -339,18 +378,14 @@ if submitted:
 
     with st.spinner("Collecting signals..."):
         results = search_results(query, RESULTS_TO_FETCH)
+
         urls     = [r.get("link","") for r in results if r.get("link")]
         titles   = [r.get("title","") for r in results]
         snippets = [r.get("snippet","") for r in results]
         domains  = [domain_from_url(u) for u in urls]
 
-        # Fail-safe: if we didn't get enough results, stop and tell the user
-        if len(urls) < 5:
-            save_lead(name, email, "INSUFFICIENT_DATA", city, org, query)
-            st.error("Not enough public results to compute a reliable score. Try adding a city/role, or use a richer provider (SerpAPI/Bing).")
-            with st.expander("Debug"):
-                st.write("First URLs:", urls[:8])
-            st.stop()
+        # Low-confidence mode if very few results
+        low_confidence = len(urls) < FALLBACK_MIN_RESULTS
 
         # Backfill empty titles with hostnames (helps DDG-lite)
         for i, t in enumerate(titles):
@@ -380,22 +415,20 @@ if submitted:
         shield = authority_shield_factor(authhits, urls)
         adjusted_score = int(round(raw_score * shield))
         adjusted_score = max(adjusted_score, notoriety_floor(urls, authhits))
+        lvl = risk_band(adjusted_score)
 
-        # Band AFTER shield/floor
-        def band(score: int) -> str:
-            if score >= 70: return "HIGH"
-            if score >= 40: return "MEDIUM"
-            return "LOW"
-        lvl = band(adjusted_score)
-
-    # Save lead (store adjusted score)
-    save_lead(name=name, email=email, score=str(adjusted_score), city=city, org=org, q=query)
+    # Save lead (store confidence label)
+    conf_label = "low" if low_confidence else "normal"
+    save_lead(name=name, email=email, score=str(adjusted_score), city=city, org=org, q=query, confidence=conf_label)
 
     # =========================
     # RESULTS UI
     # =========================
     st.markdown("---")
-    st.markdown(f"## Overall Risk: **{adjusted_score}/100** — {lvl}")
+    badge = " (low confidence)" if low_confidence else ""
+    st.markdown(f"## Overall Risk: **{adjusted_score}/100** — {lvl}{badge}")
+    if low_confidence:
+        st.info("Limited public results were found; this score is computed with reduced confidence.")
     st.progress(min(adjusted_score, 100) / 100)
 
     c1, c2 = st.columns(2)
@@ -409,7 +442,6 @@ if submitted:
         st.metric("Breach Risk", f"{subs['Breach Risk']}/5")
 
     st.markdown("### Top Recommendations")
-    # Recompute recommendations from final subs
     def quick_fixes(signals: Dict, subs: Dict[str, int]) -> List[str]:
         recs = []
         if subs["Data Broker Exposure"] >= 12:
@@ -439,6 +471,7 @@ if submitted:
 
     with st.expander("Debug"):
         st.write("Provider:", SEARCH_PROVIDER)
+        st.write("Confidence:", conf_label)
         st.write("Raw score:", raw_score, "Shield factor:", round(shield, 2), "Adjusted:", adjusted_score)
         st.write("Authority hits:", signals["authority_hits"], "| Wikipedia:", has_wikipedia(urls), "IMDb:", has_imdb(urls), "MajorPress:", major_press_hits(urls))
         st.write("Data broker hits:", signals["data_brokers"])
@@ -447,3 +480,4 @@ if submitted:
         st.write("Sample URLs:", urls[:10])
 
     st.caption("We analyze public search results and patterns only. We never display or store private information.")
+
