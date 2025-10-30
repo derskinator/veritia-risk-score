@@ -346,7 +346,7 @@ def score_from_signals(signals: Dict) -> Tuple[int, Dict[str, int]]:
     subs["Breach Risk"] = min(5, signals.get("breach_count", 0))
 
     total = int(sum(subs.values()))
-    return total, subs)
+    return total, subs
 
 # =========================
 # AUTHORITY SHIELD & GUARDRAILS
