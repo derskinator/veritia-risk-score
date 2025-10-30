@@ -7,32 +7,57 @@ from typing import List, Dict, Tuple
 
 import requests
 import streamlit as st
+from bs4 import BeautifulSoup
 
-# ====== BRAND CONFIG ======
+# =========================
+# BRAND / UI
+# =========================
 APP_TITLE = "Veritia.ai — Name Risk Score"
 APP_TAGLINE = "See what AI & search can infer about you — and how to fix it."
 PRIMARY = "#2C7FFF"  # Accent color
 
-# ====== SCAN SETTINGS ======
-SEARCH_PROVIDER = st.secrets.get("apis", {}).get("SEARCH_PROVIDER", "ddg_html")  # "bing" | "serpapi" | "ddg_html"
-RESULTS_TO_FETCH = 15
-NEGATIVE_KEYWORDS = ["arrest", "lawsuit", "scam", "fraud", "harassment", "controversy", "fired", "charged", "probe", "sued"]
+st.set_page_config(page_title="Veritia — Name Risk Score", page_icon="👁️", layout="centered")
+st.markdown(
+    f"<h1 style='text-align:center;margin-bottom:0;'>{APP_TITLE}</h1>"
+    f"<p style='text-align:center;color:#8a8f98;margin-top:4px;'>{APP_TAGLINE}</p>",
+    unsafe_allow_html=True,
+)
+
+# =========================
+# SETTINGS & CONSTANTS
+# =========================
+SEARCH_PROVIDER = st.secrets.get("apis", {}).get("SEARCH_PROVIDER", "ddg_lite")  # "serpapi" | "bing" | "ddg_lite"
+RESULTS_TO_FETCH = int(st.secrets.get("app", {}).get("RESULTS_TO_FETCH", 18))
+
+NEGATIVE_KEYWORDS = [
+    "arrest","lawsuit","scam","fraud","harassment","controversy","fired","charged","probe","sued"
+]
+
 DATA_BROKER_DOMAINS = [
     "spokeo.com","beenverified.com","mylife.com","whitepages.com","radaris.com","intelius.com",
-    "nuwber.com","truthfinder.com","peoplefinders.com","pipl.com","thatsthem.com","fastpeoplesearch.com","clustrmaps.com"
+    "nuwber.com","truthfinder.com","peoplefinders.com","pipl.com","thatsthem.com",
+    "fastpeoplesearch.com","clustrmaps.com"
 ]
-AUTHORITY_SITES = ["wikipedia.org","wikidata.org","linkedin.com","crunchbase.com","about.me","medium.com","linktr.ee"]
 
-# ====== OPTIONAL API KEYS (via Streamlit Secrets) ======
+# Expanded to strongly favor well-known authority sources
+AUTHORITY_SITES = [
+    "wikipedia.org","wikidata.org","linkedin.com","crunchbase.com","imdb.com",
+    "gov","edu","scholar.google","orcid.org","bloomberg.com","forbes.com","nytimes.com",
+    "official"  # heuristic; catches many official brand domains/titles
+]
+
+# Keys
 BING_KEY = st.secrets.get("apis", {}).get("BING_KEY", "")
 SERPAPI_KEY = st.secrets.get("apis", {}).get("SERPAPI_KEY", "")
 HIBP_KEY = st.secrets.get("apis", {}).get("HIBP_KEY", "")
 
-# ====== LEADS STORAGE CONFIG ======
+# Lead storage (Google Sheets if configured; else CSV)
 USE_SHEETS = bool(st.secrets.get("gcp_service_account")) and bool(st.secrets.get("leads"))
 CSV_FALLBACK_PATH = "leads.csv"
 
-# ====== SHEETS CLIENT (only if configured) ======
+# =========================
+# GOOGLE SHEETS (optional)
+# =========================
 def _get_ws():
     if not USE_SHEETS:
         return None
@@ -62,21 +87,40 @@ def save_lead(name: str, email: str, score: int, city: str, org: str, q: str):
                 if newfile:
                     w.writerow(["ts","name","email","score","city","org","query"])
                 w.writerow(row)
-    except Exception as e:
+    except Exception:
         st.warning("Lead save issue (we still show your results).")
 
-# ====== SEARCH HELPERS ======
-def normalize(q: str) -> str:
-    return re.sub(r"\s+", " ", q.strip())
-
-def ddg_html_search(query: str, n: int = RESULTS_TO_FETCH) -> List[Dict]:
-    """DuckDuckGo HTML (no key). Naive parse; production should consider a stable SERP API."""
+# =========================
+# SEARCH PROVIDERS
+# =========================
+def ddg_lite_search(query: str, n: int = RESULTS_TO_FETCH) -> List[Dict]:
+    """DuckDuckGo Lite HTML (no key). Returns list of {link,title,snippet}."""
     try:
-        r = requests.get("https://html.duckduckgo.com/html/", params={"q": query}, timeout=15)
+        url = "https://lite.duckduckgo.com/lite/"
+        headers = {
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/120.0.0.0 Safari/537.36")
+        }
+        r = requests.get(url, params={"q": query}, headers=headers, timeout=15)
         r.raise_for_status()
-        urls = re.findall(r'<a rel="nofollow" class="result__a" href="([^"]+)"', r.text)
-        # snippet extraction is intentionally minimal to avoid brittle parsing
-        results = [{"link": u, "title": "", "snippet": ""} for u in urls[:n]]
+        soup = BeautifulSoup(r.text, "lxml")
+
+        results = []
+        for a in soup.select("a"):
+            href = a.get("href") or ""
+            text = (a.get_text() or "").strip()
+            if href.startswith("http"):
+                # try to build a minimal snippet from nearby text nodes
+                snippet = ""
+                parent = a.find_parent()
+                if parent:
+                    snippet = " ".join((parent.get_text(" ", strip=True) or "").split())
+                    if text and snippet.startswith(text):
+                        snippet = snippet[len(text):].strip()
+                results.append({"link": href, "title": text, "snippet": snippet})
+            if len(results) >= n:
+                break
         return results
     except Exception:
         return []
@@ -109,18 +153,33 @@ def serpapi_google(query: str, n: int = RESULTS_TO_FETCH) -> List[Dict]:
     return org
 
 def search_results(query: str, n: int = RESULTS_TO_FETCH) -> List[Dict]:
-    if SEARCH_PROVIDER == "bing":
-        res = bing_search(query, n)
-        if res: return res
-    if SEARCH_PROVIDER == "serpapi":
-        res = serpapi_google(query, n)
-        if res: return res
-    # Fallback (default)
-    return ddg_html_search(query, n)
+    """Run multiple queries, merge & dedupe."""
+    base_queries = [
+        f'"{query}"',                          # exact match
+        f'"{query}" site:linkedin.com',
+        f'"{query}" -site:facebook.com -site:instagram.com'
+    ]
+    per = max(3, n // len(base_queries))
+    merged, seen = [], set()
+    for q in base_queries:
+        if SEARCH_PROVIDER == "serpapi":
+            chunk = serpapi_google(q, per)
+        elif SEARCH_PROVIDER == "bing":
+            chunk = bing_search(q, per)
+        else:
+            chunk = ddg_lite_search(q, per)
+        for r in chunk:
+            u = (r.get("link") or "").strip()
+            if u and u not in seen:
+                seen.add(u)
+                merged.append(r)
+    return merged[:n]
 
-# ====== SIGNALS & SCORING ======
+# =========================
+# SIGNALS & SCORING
+# =========================
 def detect_sensitive_patterns(text: str) -> Dict[str, int]:
-    """Count potential exposures in snippets (patterns only; we never display PII)."""
+    """Pattern counters only (no PII shown/saved)."""
     phone = len(re.findall(r"\b(?:\+?\d{1,2}\s*)?(?:\(?\d{3}\)?[\s\-.]?\d{3}[\s\-.]?\d{4})\b", text))
     street = len(re.findall(r"\b\d{1,5}\s+\w+(?:\s+\w+)?\s+(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Lane|Ln|Dr|Drive|Ct|Court)\b", text, flags=re.I))
     email = len(re.findall(r"[\w\.-]+@[\w\.-]+\.\w+", text))
@@ -137,7 +196,7 @@ def count_authority_hits(urls: List[str]) -> int:
     return sum(any(dom in (u or "") for dom in AUTHORITY_SITES) for u in urls)
 
 def hibp_breach_count(email: str) -> int:
-    """Optional breach count via HIBP; we never show breach details."""
+    """Optional breach count; safe summary only."""
     if not email or not HIBP_KEY:
         return 0
     url = f"https://haveibeenpwned.com/api/v3/breachedaccount/{email}"
@@ -150,43 +209,51 @@ def hibp_breach_count(email: str) -> int:
 
 def score_from_signals(signals: Dict) -> Tuple[int, Dict[str, int]]:
     """
-    Weighting (0 = best, 100 = worst):
-      - Data Broker Exposure (0–25)
-      - Sensitive Info Exposure (0–25)
-      - Identity Drift (0–20)
-      - Authority Deficit (0–15)
-      - Negative Press (0–10)
-      - Breach Risk (0–5)
+    0 (best) to 100 (worst). Heavier weight on Authority & Brokers for clear separation.
+    - Data Broker Exposure: 0–30 (6 pts each, cap 30)
+    - Sensitive Info Exposure: 0–25 (6 pts per phone/address pattern, cap 25)
+    - Identity Drift: 0–20 (based on domain diversity)
+    - Authority Deficit: 0–25 (0=great, 25=none)
+    - Negative Press: 0–10 (3 pts each, cap 10)
+    - Breach Risk: 0–5 (1 per breach, cap 5)
     """
     s = signals
     subs = {}
 
-    # Data brokers: each hit adds 5pts up to 25
+    # Data brokers
     brokers = s["data_brokers"]
-    subs["Data Broker Exposure"] = min(25, brokers * 5)
+    subs["Data Broker Exposure"] = min(30, brokers * 6)
 
-    # Sensitive: phones + addresses (emails are less sensitive)
+    # Sensitive patterns (phones + addresses)
     sens = s["sensitive"]["phones"] + s["sensitive"]["addresses"]
     subs["Sensitive Info Exposure"] = min(25, sens * 6)
 
-    # Identity Drift: many different titles/domains => inconsistent narrative
+    # Identity Drift (domain diversity)
     unique_domains = len(set(s["domains"]))
-    unique_titles = len(set(t for t in s["titles"] if t))
-    drift = max(0, (unique_titles // 6) + (unique_domains // 8) - 1)
-    subs["Identity Drift"] = min(20, drift * 5)
+    if unique_domains >= 10:
+        drift_points = 14
+    elif unique_domains >= 8:
+        drift_points = 10
+    elif unique_domains >= 5:
+        drift_points = 6
+    elif unique_domains >= 3:
+        drift_points = 3
+    else:
+        drift_points = 0
+    subs["Identity Drift"] = min(20, drift_points)
 
-    # Authority deficit: fewer authority sources => higher risk
+    # Authority deficit (stronger bite)
     auth = s["authority_hits"]
-    subs["Authority Deficit"] = 15 if auth == 0 else (10 if auth == 1 else (5 if auth == 2 else 0))
+    subs["Authority Deficit"] = 25 if auth == 0 else (15 if auth == 1 else (8 if auth == 2 else (3 if auth == 3 else 0)))
 
-    # Negative press: more negative headlines => higher risk
+    # Negative press
     subs["Negative Press"] = min(10, s["neg_headlines"] * 3)
 
-    # Breach risk (optional)
+    # Breach risk
     subs["Breach Risk"] = min(5, s.get("breach_count", 0))
 
-    total = sum(subs.values())
-    return int(total), subs
+    total = int(sum(subs.values()))
+    return total, subs
 
 def band(score: int) -> str:
     if score >= 70: return "HIGH"
@@ -195,13 +262,13 @@ def band(score: int) -> str:
 
 def quick_fixes(signals: Dict, subs: Dict[str, int]) -> List[str]:
     recs = []
-    if subs["Data Broker Exposure"] >= 10:
+    if subs["Data Broker Exposure"] >= 12:
         recs.append("Submit removal requests to top data brokers (Spokeo, BeenVerified, Whitepages, MyLife).")
     if subs["Sensitive Info Exposure"] >= 10:
         recs.append("Audit public posts & PDFs; remove phone/address; request cache removal where needed.")
-    if subs["Authority Deficit"] >= 5:
+    if subs["Authority Deficit"] >= 8:
         recs.append("Publish a canonical bio page with schema.org/Person; create/clean Wikidata; complete LinkedIn.")
-    if subs["Identity Drift"] >= 10:
+    if subs["Identity Drift"] >= 6:
         recs.append("Standardize your headline across LinkedIn, your site, and press mentions.")
     if subs["Negative Press"] >= 6:
         recs.append("Publish counter-narratives on credible sites; pursue structured PR to add positive citations.")
@@ -211,16 +278,11 @@ def quick_fixes(signals: Dict, subs: Dict[str, int]) -> List[str]:
         recs.append("Maintain quarterly audits; set Google Alerts; keep canonical bio & schema updated.")
     return recs[:5]
 
-# ====== UI ======
-st.set_page_config(page_title="Veritia — Name Risk Score", page_icon="👁️", layout="centered")
-st.markdown(
-    f"<h1 style='text-align:center;margin-bottom:0;'>{APP_TITLE}</h1>"
-    f"<p style='text-align:center;color:#8a8f98;margin-top:4px;'>{APP_TAGLINE}</p>",
-    unsafe_allow_html=True,
-)
-
+# =========================
+# FORM (Lead Gate)
+# =========================
 with st.form("risk_form"):
-    name = st.text_input("Full name*", placeholder="e.g., Alex Johnson")
+    name = st.text_input("Full name*", placeholder="e.g., Keanu Reeves")
     city = st.text_input("City / Region (optional)")
     org  = st.text_input("Company / Role (optional)")
     email = st.text_input("Email to receive your report*", placeholder="you@domain.com")
@@ -233,12 +295,12 @@ if submitted:
         st.error("Please complete name, email, and both checkboxes.")
         st.stop()
 
-    q = normalize(" ".join([x for x in [name, city, org] if x]))
-    st.info(f"Scanning public results for: **{q}**")
+    query = " ".join([x for x in [name, city, org] if x]).strip()
+    st.info(f"Scanning public results for: **{query}**")
 
     with st.spinner("Collecting signals..."):
-        results = search_results(q, RESULTS_TO_FETCH)
-        urls = [r.get("link","") for r in results if r.get("link")]
+        results = search_results(query, RESULTS_TO_FETCH)
+        urls   = [r.get("link","") for r in results if r.get("link")]
         titles = [r.get("title","") for r in results]
         snippets = [r.get("snippet","") for r in results]
 
@@ -247,6 +309,11 @@ if submitted:
         for u in urls:
             d = re.sub(r"^https?://(www\.)?", "", u).split("/")[0] if u else ""
             domains.append(d)
+
+        # backfill empty titles with hostname (helps DDG-lite)
+        for i, t in enumerate(titles):
+            if not t and i < len(domains) and domains[i]:
+                titles[i] = domains[i].split(".")[0].title()
 
         combined_snippets = " ".join(snippets)
         sens = detect_sensitive_patterns(combined_snippets)
@@ -267,20 +334,23 @@ if submitted:
         score, subs = score_from_signals(signals)
         lvl = band(score)
 
-    # Save lead after successful scan
-    save_lead(name=name, email=email, score=score, city=city, org=org, q=q)
+    # Save lead
+    save_lead(name=name, email=email, score=score, city=city, org=org, q=query)
 
+    # =========================
+    # RESULTS UI
+    # =========================
     st.markdown("---")
     st.markdown(f"## Overall Risk: **{score}/100** — {lvl}")
     st.progress(min(score, 100) / 100)
 
     col1, col2 = st.columns(2)
     with col1:
-        st.metric("Data Broker Exposure", f"{subs['Data Broker Exposure']}/25")
+        st.metric("Data Broker Exposure", f"{subs['Data Broker Exposure']}/30")
         st.metric("Sensitive Info Exposure", f"{subs['Sensitive Info Exposure']}/25")
         st.metric("Identity Drift", f"{subs['Identity Drift']}/20")
     with col2:
-        st.metric("Authority Deficit", f"{subs['Authority Deficit']}/15")
+        st.metric("Authority Deficit", f"{subs['Authority Deficit']}/25")
         st.metric("Negative Press", f"{subs['Negative Press']}/10")
         st.metric("Breach Risk", f"{subs['Breach Risk']}/5")
 
@@ -296,13 +366,15 @@ if submitted:
         if email:
             st.write(f"- Potential breach count (HIBP): {breach}")
 
-    st.caption("This tool analyzes public search results and generic patterns only. "
-               "It does not store content from results, reveal private data, or provide doxxing methods.")
+    with st.expander("Debug (temporary)"):
+        st.write("Search provider:", SEARCH_PROVIDER)
+        st.write("Authority hits:", signals["authority_hits"])
+        st.write("Data broker hits:", signals["data_brokers"])
+        st.write("Negative headlines:", signals["neg_headlines"])
+        st.write("Unique domains:", len(set(signals["domains"])))
+        st.write("Sample URLs:", urls[:8])
 
-    st.markdown("---")
-    st.markdown(
-        "<div style='text-align:center'>"
-        "<b>Want a full Veritia audit?</b><br/>"
-        "We’ll fix bios, add schema, remove data broker listings, and align your narrative across AI search."
-        "</div>", unsafe_allow_html=True
+    st.caption(
+        "This tool analyzes public search results and generic patterns only. "
+        "It does not store content from results, reveal private data, or provide doxxing methods."
     )
